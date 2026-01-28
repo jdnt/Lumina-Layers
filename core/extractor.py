@@ -1,6 +1,6 @@
 """
 Lumina Studio - Color Extractor Module
-颜色提取模块
+Color extraction module
 """
 
 import os

@@ -1,6 +1,6 @@
 """
 ╔═══════════════════════════════════════════════════════════════════════════════╗
-║                          LUMINA STUDIO v1.4                                   ║
+║                          LUMINA STUDIO v1.4.1                                 ║
 ║                    Multi-Material 3D Print Color System                       ║
 ╠═══════════════════════════════════════════════════════════════════════════════╣
 ║  Author: [MIN]                                                                ║
@@ -17,7 +17,7 @@ import threading
 import webbrowser
 import socket
 import gradio as gr     # type:ignore
-from ui.layout import create_app
+from ui.layout_new import create_app
 from ui.styles import CUSTOM_CSS
 
 HAS_DISPLAY = os.environ.get("DISPLAY") or os.name == "nt"

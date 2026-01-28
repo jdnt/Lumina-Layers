@@ -1,6 +1,6 @@
 """
 Lumina Studio - Configuration Module
-包含所有配置类、常量和国际化文本
+Contains all configuration classes, constants, and internationalization texts
 """
 
 import os
@@ -148,7 +148,7 @@ class ColorSystem:
             3: [244, 238, 42, 255]
         },
         'map': {"White": 0, "Cyan": 1, "Magenta": 2, "Yellow": 3},
-        # 定位点顺序: TL, TR, BR, BL
+        # Corner point order: TL, TR, BR, BL
         'corner_labels': ["白色 (左上)", "青色 (右上)", "品红 (右下)", "黄色 (左下)"],
         'corner_labels_en': ["White (TL)", "Cyan (TR)", "Magenta (BR)", "Yellow (BL)"]
     }
@@ -163,7 +163,7 @@ class ColorSystem:
             3: [0, 100, 240, 255]
         },
         'map': {"White": 0, "Red": 1, "Yellow": 2, "Blue": 3},
-        # 定位点顺序: TL, TR, BR, BL
+        # Corner point order: TL, TR, BR, BL
         'corner_labels': ["白色 (左上)", "红色 (右上)", "蓝色 (右下)", "黄色 (左下)"],
         'corner_labels_en': ["White (TL)", "Red (TR)", "Blue (BR)", "Yellow (BL)"]
     }

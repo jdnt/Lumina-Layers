@@ -1,7 +1,7 @@
 """
 Lumina Studio - Image Converter Coordinator (Refactored)
-图像转换协调器 - 重构版本
-负责协调各个模块完成图像到3D模型的转换
+Image conversion coordinator - Refactored version
+Coordinates modules to complete image-to-3D model conversion
 """
 
 import os
@@ -15,72 +15,171 @@ import gradio as gr
 from config import PrinterConfig, ColorSystem, PREVIEW_SCALE, PREVIEW_MARGIN
 from utils import Stats, safe_fix_3mf_names
 
-# 导入重构后的模块
+# Import refactored modules
 from core.image_processing import LuminaImageProcessor
 from core.mesh_generators import get_mesher
 from core.geometry_utils import create_keychain_loop
 
 
-# ========== 主转换函数 ==========
+# ========== Debug Helper Functions ==========
+
+def _save_debug_preview(debug_data, material_matrix, mask_solid, image_path, mode_name):
+    """
+    Save vector mode debug preview image
+    
+    Shows the K-Means quantized image, which is the actual input the vectorizer receives
+    Optional: Draw contours on the image to show shape recognition results
+    
+    Args:
+        debug_data: Debug data dictionary
+        material_matrix: Material matrix
+        mask_solid: Solid mask
+        image_path: Original image path
+        mode_name: Mode name
+    """
+    quantized_image = debug_data['quantized_image']
+    num_colors = debug_data['num_colors']
+    
+    print(f"[DEBUG_PREVIEW] Saving {mode_name} debug preview...")
+    print(f"[DEBUG_PREVIEW] Quantized to {num_colors} colors")
+    
+    # Create debug image (RGB format)
+    debug_img = quantized_image.copy()
+    
+    # Optional: Draw contours to show how the vectorizer interprets shapes
+    try:
+        # Draw contours for each material
+        contour_overlay = debug_img.copy()
+        
+        for mat_id in range(4):
+            # Get mask for this material
+            mat_mask = np.zeros(material_matrix.shape[:2], dtype=np.uint8)
+            for layer in range(material_matrix.shape[2]):
+                mat_mask = np.logical_or(mat_mask, material_matrix[:, :, layer] == mat_id)
+            
+            mat_mask = np.logical_and(mat_mask, mask_solid).astype(np.uint8) * 255
+            
+            if not np.any(mat_mask):
+                continue
+            
+            # Find contours
+            contours, _ = cv2.findContours(
+                mat_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+            )
+            
+            # Draw contours (black thin lines)
+            cv2.drawContours(contour_overlay, contours, -1, (0, 0, 0), 1)
+        
+        debug_img = contour_overlay
+        print(f"[DEBUG_PREVIEW] Contours drawn on preview")
+        
+    except Exception as e:
+        print(f"[DEBUG_PREVIEW] Warning: Could not draw contours: {e}")
+    
+    # Save debug image
+    base_name = os.path.splitext(os.path.basename(image_path))[0]
+    debug_path = os.path.join(tempfile.gettempdir(), f"{base_name}_{mode_name}_Debug.png")
+    
+    # Convert to PIL image and save
+    debug_pil = Image.fromarray(debug_img, mode='RGB')
+    debug_pil.save(debug_path, 'PNG')
+    
+    print(f"[DEBUG_PREVIEW] ✅ Saved: {debug_path}")
+    print(f"[DEBUG_PREVIEW] This is the EXACT image the vectorizer sees before meshing")
+
+
+# ========== Main Conversion Function ==========
 
 def convert_image_to_3d(image_path, lut_path, target_width_mm, spacer_thick,
                          structure_mode, auto_bg, bg_tol, color_mode,
                          add_loop, loop_width, loop_length, loop_hole, loop_pos,
-                         modeling_mode="vector", quantize_colors=32):
+                         modeling_mode="vector", quantize_colors=32,
+                         blur_kernel=0, smooth_sigma=10):
     """
-    主转换函数：将图像转换为3D模型
+    Main conversion function: Convert image to 3D model
     
-    这是重构后的协调器函数，负责：
-    1. 调用 LuminaImageProcessor 处理图像
-    2. 调用 get_mesher 获取网格生成器
-    3. 生成各材质的网格
-    4. 添加挂孔（如果需要）
-    5. 导出3MF文件
+    This is the refactored coordinator function responsible for:
+    1. Calling LuminaImageProcessor to process the image
+    2. Calling get_mesher to get the mesh generator
+    3. Generating meshes for each material
+    4. Adding keychain loop (if needed)
+    5. Exporting 3MF file
+    
+    Args:
+        lut_path: LUT file path (string) or Gradio File object
+        blur_kernel: Median filter kernel size (0=disabled, recommended 0-5, default 0)
+        smooth_sigma: Bilateral filter sigma value (recommended 5-20, default 10)
     """
-    # 输入验证
+    # Input validation
     if image_path is None:
-        return None, None, None, "❌ 请上传图片"
+        return None, None, None, "❌ Please upload an image"
     if lut_path is None:
-        return None, None, None, "⚠️ 请上传 .npy 校准文件！"
+        return None, None, None, "⚠️ Please select or upload a .npy calibration file!"
+    
+    # Handle LUT path (supports string path or Gradio File object)
+    if isinstance(lut_path, str):
+        actual_lut_path = lut_path
+    elif hasattr(lut_path, 'name'):
+        actual_lut_path = lut_path.name
+    else:
+        return None, None, None, "❌ Invalid LUT file format"
     
     print(f"[CONVERTER] Starting conversion...")
     print(f"[CONVERTER] Mode: {modeling_mode}, Quantize: {quantize_colors}")
+    print(f"[CONVERTER] Filters: blur_kernel={blur_kernel}, smooth_sigma={smooth_sigma}")
+    print(f"[CONVERTER] LUT: {actual_lut_path}")
     
-    # 获取色彩配置
+    # Get color configuration
     color_conf = ColorSystem.get(color_mode)
     slot_names = color_conf['slots']
     preview_colors = color_conf['preview']
     
-    # ========== 步骤1: 图像处理 ==========
+    # ========== Step 1: Image Processing ==========
     try:
-        processor = LuminaImageProcessor(lut_path.name, color_mode)
+        processor = LuminaImageProcessor(actual_lut_path, color_mode)
         result = processor.process_image(
             image_path=image_path,
             target_width_mm=target_width_mm,
             modeling_mode=modeling_mode,
             quantize_colors=quantize_colors,
             auto_bg=auto_bg,
-            bg_tol=bg_tol
+            bg_tol=bg_tol,
+            blur_kernel=blur_kernel,
+            smooth_sigma=smooth_sigma
         )
     except Exception as e:
-        return None, None, None, f"❌ 图像处理失败: {e}"
+        return None, None, None, f"❌ Image processing failed: {e}"
     
-    # 提取处理结果
+    # Extract processing results
     matched_rgb = result['matched_rgb']
     material_matrix = result['material_matrix']
     mask_solid = result['mask_solid']
     target_w, target_h = result['dimensions']
     pixel_scale = result['pixel_scale']
     mode_info = result['mode_info']
+    debug_data = result.get('debug_data', None)
     
     print(f"[CONVERTER] Image processed: {target_w}×{target_h}px, scale={pixel_scale}mm/px")
     
-    # ========== 步骤2: 生成预览图像 ==========
+    # ========== Step 2: Save Debug Preview (High-Fidelity mode only) ==========
+    if debug_data is not None and mode_info['use_high_fidelity']:
+        try:
+            _save_debug_preview(
+                debug_data=debug_data,
+                material_matrix=material_matrix,
+                mask_solid=mask_solid,
+                image_path=image_path,
+                mode_name=mode_info['name']
+            )
+        except Exception as e:
+            print(f"[CONVERTER] Warning: Failed to save debug preview: {e}")
+    
+    # ========== Step 3: Generate Preview Image ==========
     preview_rgba = np.zeros((target_h, target_w, 4), dtype=np.uint8)
     preview_rgba[mask_solid, :3] = matched_rgb[mask_solid]
     preview_rgba[mask_solid, 3] = 255
     
-    # ========== 步骤3: 处理挂孔 ==========
+    # ========== Step 4: Handle Keychain Loop ==========
     loop_info = None
     if add_loop and loop_pos is not None:
         loop_info = _calculate_loop_info(
@@ -89,14 +188,14 @@ def convert_image_to_3d(image_path, lut_path, target_width_mm, spacer_thick,
         )
         
         if loop_info:
-            # 在预览图上绘制挂孔
+            # Draw loop on preview image
             preview_rgba = _draw_loop_on_preview(
                 preview_rgba, loop_info, color_conf, pixel_scale
             )
     
     preview_img = Image.fromarray(preview_rgba, mode='RGBA')
     
-    # ========== 步骤4: 构建体素矩阵 ==========
+    # ========== Step 5: Build Voxel Matrix ==========
     full_matrix = _build_voxel_matrix(
         material_matrix, mask_solid, spacer_thick, structure_mode
     )
@@ -104,10 +203,10 @@ def convert_image_to_3d(image_path, lut_path, target_width_mm, spacer_thick,
     total_layers = full_matrix.shape[0]
     print(f"[CONVERTER] Voxel matrix: {full_matrix.shape} (Z×H×W)")
     
-    # ========== 步骤5: 生成3D网格 ==========
+    # ========== Step 6: Generate 3D Meshes ==========
     scene = trimesh.Scene()
     
-    # 创建变换矩阵 (像素 → 毫米)
+    # Create transformation matrix (pixel → millimeter)
     transform = np.eye(4)
     transform[0, 0] = pixel_scale  # X
     transform[1, 1] = pixel_scale  # Y
@@ -115,11 +214,11 @@ def convert_image_to_3d(image_path, lut_path, target_width_mm, spacer_thick,
     
     print(f"[CONVERTER] Transform: XY={pixel_scale}mm/px, Z={PrinterConfig.LAYER_HEIGHT}mm/layer")
     
-    # 获取网格生成器
+    # Get mesh generator
     mesher = get_mesher(modeling_mode)
     print(f"[CONVERTER] Using mesher: {mesher.__class__.__name__}")
     
-    # 为每种材质生成网格
+    # Generate mesh for each material
     for mat_id in range(4):
         mesh = mesher.generate_mesh(full_matrix, mat_id, target_h)
         if mesh:
@@ -133,7 +232,7 @@ def convert_image_to_3d(image_path, lut_path, target_width_mm, spacer_thick,
             )
             print(f"[CONVERTER] Added mesh for {slot_names[mat_id]}")
     
-    # ========== 步骤6: 添加挂孔 ==========
+    # ========== Step 7: Add Keychain Loop ==========
     loop_added = False
     slot_names_with_loop = slot_names
     
@@ -163,23 +262,23 @@ def convert_image_to_3d(image_path, lut_path, target_width_mm, spacer_thick,
         except Exception as e:
             print(f"[CONVERTER] Loop creation failed: {e}")
     
-    # ========== 步骤7: 导出3MF ==========
+    # ========== Step 8: Export 3MF ==========
     base_name = os.path.splitext(os.path.basename(image_path))[0]
     out_path = os.path.join(tempfile.gettempdir(), f"{base_name}_Lumina.3mf")
     scene.export(out_path)
     
-    # 修复3MF对象名称
+    # Fix 3MF object names
     safe_fix_3mf_names(out_path, slot_names_with_loop)
     
     print(f"[CONVERTER] 3MF exported: {out_path}")
     
-    # ========== 步骤8: 生成3D预览 ==========
+    # ========== Step 9: Generate 3D Preview ==========
     preview_mesh = _create_preview_mesh(matched_rgb, mask_solid, total_layers)
     
     if preview_mesh:
         preview_mesh.apply_transform(transform)
         
-        # 添加挂孔到预览
+        # Add loop to preview
         if loop_added and loop_info:
             try:
                 preview_loop = create_keychain_loop(
@@ -203,30 +302,30 @@ def convert_image_to_3d(image_path, lut_path, target_width_mm, spacer_thick,
     else:
         glb_path = None
     
-    # ========== 步骤9: 生成状态消息 ==========
+    # ========== Step 10: Generate Status Message ==========
     Stats.increment("conversions")
     
     mode_name = mode_info['name']
-    msg = f"✅ 转换完成 ({mode_name})！分辨率: {target_w}×{target_h}px"
+    msg = f"✅ Conversion complete ({mode_name})! Resolution: {target_w}×{target_h}px"
     
     if loop_added:
-        msg += f" | 挂孔: {slot_names[loop_info['color_id']]}"
+        msg += f" | Loop: {slot_names[loop_info['color_id']]}"
     
     total_pixels = target_w * target_h
     if glb_path is None and total_pixels > 2_000_000:
-        msg += " | ⚠️ 模型过大，已禁用3D预览"
+        msg += " | ⚠️ Model too large, 3D preview disabled"
     elif glb_path and total_pixels > 500_000:
-        msg += " | ℹ️ 3D预览已简化"
+        msg += " | ℹ️ 3D preview simplified"
     
     return out_path, glb_path, preview_img, msg
 
 
 
-# ========== 辅助函数 ==========
+# ========== Helper Functions ==========
 
 def _calculate_loop_info(loop_pos, loop_width, loop_length, loop_hole,
                          mask_solid, material_matrix, target_w, target_h, pixel_scale):
-    """计算挂孔信息"""
+    """Calculate keychain loop information"""
     solid_rows = np.any(mask_solid, axis=1)
     if not np.any(solid_rows):
         return None
@@ -237,7 +336,7 @@ def _calculate_loop_info(loop_pos, loop_width, loop_length, loop_hole,
     attach_col = max(0, min(target_w - 1, attach_col))
     attach_row = max(0, min(target_h - 1, attach_row))
     
-    # 找到最近的实体行
+    # Find nearest solid row
     col_mask = mask_solid[:, attach_col]
     if np.any(col_mask):
         solid_rows_in_col = np.where(col_mask)[0]
@@ -256,7 +355,7 @@ def _calculate_loop_info(loop_pos, loop_width, loop_length, loop_hole,
     
     attach_col = max(0, min(target_w - 1, attach_col))
     
-    # 检测挂孔颜色
+    # Detect loop color
     loop_color_id = 0
     search_area = material_matrix[
         max(0, top_row-2):top_row+3,
@@ -281,13 +380,13 @@ def _calculate_loop_info(loop_pos, loop_width, loop_length, loop_hole,
 
 
 def _draw_loop_on_preview(preview_rgba, loop_info, color_conf, pixel_scale):
-    """在预览图上绘制挂孔"""
+    """Draw keychain loop on preview image"""
     preview_pil = Image.fromarray(preview_rgba, mode='RGBA')
     draw = ImageDraw.Draw(preview_pil)
     
     loop_color_rgba = tuple(color_conf['preview'][loop_info['color_id']][:3]) + (255,)
     
-    # 转换为像素坐标
+    # Convert to pixel coordinates
     attach_col = int(loop_info['attach_x_mm'] / pixel_scale)
     attach_row = int((preview_rgba.shape[0] - 1) - loop_info['attach_y_mm'] / pixel_scale)
     
@@ -296,7 +395,7 @@ def _draw_loop_on_preview(preview_rgba, loop_info, color_conf, pixel_scale):
     hole_r_px = int(loop_info['hole_dia_mm'] / 2 / pixel_scale)
     circle_r_px = loop_w_px // 2
     
-    # 计算位置
+    # Calculate positions
     loop_bottom = attach_row
     loop_left = attach_col - loop_w_px // 2
     loop_right = attach_col + loop_w_px // 2
@@ -308,21 +407,21 @@ def _draw_loop_on_preview(preview_rgba, loop_info, color_conf, pixel_scale):
     circle_center_y = rect_top
     circle_center_x = attach_col
     
-    # 绘制矩形
+    # Draw rectangle
     if rect_h_px > 0:
         draw.rectangle(
             [loop_left, rect_top, loop_right, rect_bottom], 
             fill=loop_color_rgba
         )
     
-    # 绘制半圆
+    # Draw semicircle
     draw.ellipse(
         [circle_center_x - circle_r_px, circle_center_y - circle_r_px,
          circle_center_x + circle_r_px, circle_center_y + circle_r_px],
         fill=loop_color_rgba
     )
     
-    # 绘制孔洞
+    # Draw hole
     draw.ellipse(
         [circle_center_x - hole_r_px, circle_center_y - hole_r_px,
          circle_center_x + hole_r_px, circle_center_y + hole_r_px],
@@ -333,42 +432,42 @@ def _draw_loop_on_preview(preview_rgba, loop_info, color_conf, pixel_scale):
 
 
 def _build_voxel_matrix(material_matrix, mask_solid, spacer_thick, structure_mode):
-    """构建完整的体素矩阵"""
+    """Build complete voxel matrix"""
     target_h, target_w = material_matrix.shape[:2]
     mask_transparent = ~mask_solid
     
-    # 转置材质矩阵 (H, W, Layers) → (Layers, H, W)
+    # Transpose material matrix (H, W, Layers) → (Layers, H, W)
     bottom_voxels = np.transpose(material_matrix, (2, 0, 1))
     
-    # 计算背板层数
+    # Calculate backing layers
     spacer_layers = max(1, int(round(spacer_thick / PrinterConfig.LAYER_HEIGHT)))
     
-    if "双面" in structure_mode:
-        # 双面模式
+    if "双面" in structure_mode or "Double" in structure_mode:
+        # Double-sided mode
         top_voxels = np.transpose(material_matrix[..., ::-1], (2, 0, 1))
         total_layers = 5 + spacer_layers + 5
         full_matrix = np.full((total_layers, target_h, target_w), -1, dtype=int)
         
-        # 底层
+        # Bottom layers
         full_matrix[0:5] = bottom_voxels
         
-        # 背板
+        # Backing
         spacer = np.full((target_h, target_w), -1, dtype=int)
         spacer[~mask_transparent] = 0
         for z in range(5, 5 + spacer_layers):
             full_matrix[z] = spacer
         
-        # 顶层
+        # Top layers
         full_matrix[5 + spacer_layers:] = top_voxels
     else:
-        # 单面模式
+        # Single-sided mode
         total_layers = 5 + spacer_layers
         full_matrix = np.full((total_layers, target_h, target_w), -1, dtype=int)
         
-        # 底层
+        # Bottom layers
         full_matrix[0:5] = bottom_voxels
         
-        # 背板
+        # Backing
         spacer = np.full((target_h, target_w), -1, dtype=int)
         spacer[~mask_transparent] = 0
         for z in range(5, total_layers):
@@ -379,8 +478,8 @@ def _build_voxel_matrix(material_matrix, mask_solid, spacer_thick, structure_mod
 
 def _create_preview_mesh(matched_rgb, mask_solid, total_layers):
     """
-    创建简化的3D预览网格
-    用于在浏览器中显示
+    Create simplified 3D preview mesh
+    For display in browser
     """
     height, width = matched_rgb.shape[:2]
     total_pixels = width * height
@@ -389,13 +488,13 @@ def _create_preview_mesh(matched_rgb, mask_solid, total_layers):
     SIMPLIFY_THRESHOLD = 500_000
     TARGET_PIXELS = 300_000
     
-    # 检查是否需要禁用预览
+    # Check if preview needs to be disabled
     if total_pixels > DISABLE_THRESHOLD:
         print(f"[PREVIEW] Model too large ({total_pixels:,} pixels)")
         print(f"[PREVIEW] 3D preview disabled to prevent crash")
         return None
     
-    # 检查是否需要降采样
+    # Check if downsampling is needed
     if total_pixels > SIMPLIFY_THRESHOLD:
         scale_factor = int(np.sqrt(total_pixels / TARGET_PIXELS))
         scale_factor = max(2, min(scale_factor, 16))
@@ -419,7 +518,7 @@ def _create_preview_mesh(matched_rgb, mask_solid, total_layers):
     else:
         shrink = 0.05
     
-    # 生成体素网格
+    # Generate voxel mesh
     vertices = []
     faces = []
     face_colors = []
@@ -468,46 +567,58 @@ def _create_preview_mesh(matched_rgb, mask_solid, total_layers):
 
 
 
-# ========== 预览相关函数 ==========
+# ========== Preview Related Functions ==========
 
 def generate_preview_cached(image_path, lut_path, target_width_mm,
                             auto_bg, bg_tol, color_mode):
     """
-    生成预览并缓存数据
-    用于2D预览界面
+    Generate preview and cache data
+    For 2D preview interface
+    
+    Uses same smart defaults for consistency
     """
     if image_path is None:
-        return None, None, "❌ 请上传图片"
+        return None, None, "❌ Please upload an image"
     if lut_path is None:
-        return None, None, "⚠️ 请上传校准文件"
+        return None, None, "⚠️ Please select or upload calibration file"
+    
+    # Handle LUT path (supports string path or Gradio File object)
+    if isinstance(lut_path, str):
+        actual_lut_path = lut_path
+    elif hasattr(lut_path, 'name'):
+        actual_lut_path = lut_path.name
+    else:
+        return None, None, "❌ Invalid LUT file format"
     
     color_conf = ColorSystem.get(color_mode)
     
-    # 使用简化的处理流程（像素模式）
+    # Use simplified processing pipeline (pixel mode)
     try:
-        processor = LuminaImageProcessor(lut_path.name, color_mode)
+        processor = LuminaImageProcessor(actual_lut_path, color_mode)
         result = processor.process_image(
             image_path=image_path,
             target_width_mm=target_width_mm,
-            modeling_mode="voxel",  # 预览使用像素模式
+            modeling_mode="pixel",  # Preview uses pixel mode
             quantize_colors=16,
             auto_bg=auto_bg,
-            bg_tol=bg_tol
+            bg_tol=bg_tol,
+            blur_kernel=0,      # Preview also uses same defaults
+            smooth_sigma=10
         )
     except Exception as e:
-        return None, None, f"❌ 预览生成失败: {e}"
+        return None, None, f"❌ Preview generation failed: {e}"
     
     matched_rgb = result['matched_rgb']
     material_matrix = result['material_matrix']
     mask_solid = result['mask_solid']
     target_w, target_h = result['dimensions']
     
-    # 生成预览图像
+    # Generate preview image
     preview_rgba = np.zeros((target_h, target_w, 4), dtype=np.uint8)
     preview_rgba[mask_solid, :3] = matched_rgb[mask_solid]
     preview_rgba[mask_solid, 3] = 255
     
-    # 缓存数据
+    # Cache data
     cache = {
         'target_w': target_w,
         'target_h': target_h,
@@ -518,18 +629,18 @@ def generate_preview_cached(image_path, lut_path, target_width_mm,
         'color_conf': color_conf
     }
     
-    # 渲染带网格的预览
+    # Render preview with grid
     display = render_preview(
         preview_rgba, None, 0, 0, 0, 0, False, color_conf
     )
     
-    return display, cache, f"✅ 预览 ({target_w}×{target_h}px) | 点击图片放置挂孔"
+    return display, cache, f"✅ Preview ({target_w}×{target_h}px) | Click image to place loop"
 
 
 def render_preview(preview_rgba, loop_pos, loop_width, loop_length, 
                    loop_hole, loop_angle, loop_enabled, color_conf):
     """
-    渲染带挂孔和坐标网格的预览图
+    Render preview with keychain loop and coordinate grid
     """
     h, w = preview_rgba.shape[:2]
     new_w, new_h = w * PREVIEW_SCALE, h * PREVIEW_SCALE
@@ -538,35 +649,35 @@ def render_preview(preview_rgba, loop_pos, loop_width, loop_length,
     canvas_w = new_w + margin
     canvas_h = new_h + margin
     
-    # 创建画布
+    # Create canvas
     canvas = Image.new('RGBA', (canvas_w, canvas_h), (240, 240, 245, 255))
     draw = ImageDraw.Draw(canvas)
     
-    # 绘制网格
+    # Draw grid
     grid_color = (220, 220, 225, 255)
     grid_color_main = (200, 200, 210, 255)
     
     grid_step = 10 * PREVIEW_SCALE
     main_step = 50 * PREVIEW_SCALE
     
-    # 细网格
+    # Fine grid
     for x in range(margin, canvas_w, grid_step):
         draw.line([(x, margin), (x, canvas_h)], fill=grid_color, width=1)
     for y in range(margin, canvas_h, grid_step):
         draw.line([(margin, y), (canvas_w, y)], fill=grid_color, width=1)
     
-    # 粗网格
+    # Coarse grid
     for x in range(margin, canvas_w, main_step):
         draw.line([(x, margin), (x, canvas_h)], fill=grid_color_main, width=1)
     for y in range(margin, canvas_h, main_step):
         draw.line([(margin, y), (canvas_w, y)], fill=grid_color_main, width=1)
     
-    # 坐标轴
+    # Coordinate axes
     axis_color = (100, 100, 120, 255)
     draw.line([(margin, margin), (margin, canvas_h)], fill=axis_color, width=2)
     draw.line([(margin, canvas_h - 1), (canvas_w, canvas_h - 1)], fill=axis_color, width=2)
     
-    # 坐标标签
+    # Coordinate labels
     label_color = (80, 80, 100, 255)
     try:
         font = ImageFont.load_default()
@@ -584,12 +695,12 @@ def render_preview(preview_rgba, loop_pos, loop_width, loop_length,
         if font:
             draw.text((5, y - 5), str(px_value), fill=label_color, font=font)
     
-    # 粘贴图像
+    # Paste image
     pil_img = Image.fromarray(preview_rgba, mode='RGBA')
     pil_img = pil_img.resize((new_w, new_h), Image.Resampling.NEAREST)
     canvas.paste(pil_img, (margin, 0), pil_img)
     
-    # 绘制挂孔
+    # Draw keychain loop
     if loop_enabled and loop_pos is not None:
         canvas = _draw_loop_on_canvas(
             canvas, loop_pos, loop_width, loop_length, 
@@ -601,7 +712,7 @@ def render_preview(preview_rgba, loop_pos, loop_width, loop_length,
 
 def _draw_loop_on_canvas(pil_img, loop_pos, loop_width, loop_length, 
                          loop_hole, loop_angle, color_conf, margin):
-    """在画布上绘制挂孔标记"""
+    """Draw keychain loop marker on canvas"""
     loop_w_px = int(loop_width / PrinterConfig.NOZZLE_WIDTH * PREVIEW_SCALE)
     loop_h_px = int(loop_length / PrinterConfig.NOZZLE_WIDTH * PREVIEW_SCALE)
     hole_r_px = int(loop_hole / 2 / PrinterConfig.NOZZLE_WIDTH * PREVIEW_SCALE)
@@ -610,7 +721,7 @@ def _draw_loop_on_canvas(pil_img, loop_pos, loop_width, loop_length,
     cx = int(loop_pos[0] * PREVIEW_SCALE) + margin
     cy = int(loop_pos[1] * PREVIEW_SCALE)
     
-    # 创建挂孔图层
+    # Create loop layer
     loop_size = max(loop_w_px, loop_h_px) * 2 + 20
     loop_layer = Image.new('RGBA', (loop_size, loop_size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(loop_layer)
@@ -621,34 +732,34 @@ def _draw_loop_on_canvas(pil_img, loop_pos, loop_width, loop_length,
     loop_color = (220, 60, 60, 200)
     outline_color = (255, 255, 255, 255)
     
-    # 绘制矩形
+    # Draw rectangle
     draw.rectangle(
         [lc - loop_w_px//2, lc, lc + loop_w_px//2, lc + rect_h],
         fill=loop_color, outline=outline_color, width=2
     )
     
-    # 绘制半圆
+    # Draw semicircle
     draw.ellipse(
         [lc - circle_r_px, lc - circle_r_px,
          lc + circle_r_px, lc + circle_r_px],
         fill=loop_color, outline=outline_color, width=2
     )
     
-    # 绘制孔洞
+    # Draw hole
     draw.ellipse(
         [lc - hole_r_px, lc - hole_r_px,
          lc + hole_r_px, lc + hole_r_px],
         fill=(0, 0, 0, 0)
     )
     
-    # 旋转
+    # Rotate
     if loop_angle != 0:
         loop_layer = loop_layer.rotate(
             -loop_angle, center=(lc, lc),
             expand=False, resample=Image.BICUBIC
         )
     
-    # 粘贴到画布
+    # Paste to canvas
     paste_x = cx - lc
     paste_y = cy - lc - rect_h // 2
     pil_img.paste(loop_layer, (paste_x, paste_y), loop_layer)
@@ -657,14 +768,14 @@ def _draw_loop_on_canvas(pil_img, loop_pos, loop_width, loop_length,
 
 
 def on_preview_click(cache, loop_pos, evt: gr.SelectData):
-    """处理预览图点击事件"""
+    """Handle preview image click event"""
     if evt is None or cache is None:
-        return loop_pos, False, "点击无效 - 请先生成预览"
+        return loop_pos, False, "Invalid click - please generate preview first"
     
     click_x, click_y = evt.index
     click_x = click_x - PREVIEW_MARGIN
     
-    # 转换为原始坐标
+    # Convert to original coordinates
     orig_x = click_x / PREVIEW_SCALE
     orig_y = click_y / PREVIEW_SCALE
     
@@ -673,13 +784,13 @@ def on_preview_click(cache, loop_pos, evt: gr.SelectData):
     orig_x = max(0, min(target_w - 1, orig_x))
     orig_y = max(0, min(target_h - 1, orig_y))
     
-    pos_info = f"位置: ({orig_x:.1f}, {orig_y:.1f}) px"
+    pos_info = f"Position: ({orig_x:.1f}, {orig_y:.1f}) px"
     return (orig_x, orig_y), True, pos_info
 
 
 def update_preview_with_loop(cache, loop_pos, add_loop,
                             loop_width, loop_length, loop_hole, loop_angle):
-    """更新预览图（带挂孔）"""
+    """Update preview image (with keychain loop)"""
     if cache is None:
         return None
     
@@ -696,8 +807,8 @@ def update_preview_with_loop(cache, loop_pos, add_loop,
 
 
 def on_remove_loop():
-    """移除挂孔"""
-    return None, False, 0, "已移除挂孔"
+    """Remove keychain loop"""
+    return None, False, 0, "Loop removed"
 
 
 def generate_final_model(image_path, lut_path, target_width_mm, spacer_thick,
@@ -705,12 +816,18 @@ def generate_final_model(image_path, lut_path, target_width_mm, spacer_thick,
                         add_loop, loop_width, loop_length, loop_hole, loop_pos,
                         modeling_mode="vector", quantize_colors=64):
     """
-    生成最终模型的包装函数
-    直接调用主转换函数
+    Wrapper function for generating final model
+    Directly calls main conversion function
+    
+    Uses smart defaults:
+    - blur_kernel=0 (disable median filter, preserve details)
+    - smooth_sigma=10 (gentle bilateral filter, preserve edges)
     """
     return convert_image_to_3d(
         image_path, lut_path, target_width_mm, spacer_thick,
         structure_mode, auto_bg, bg_tol, color_mode,
         add_loop, loop_width, loop_length, loop_hole, loop_pos,
-        modeling_mode, quantize_colors
+        modeling_mode, quantize_colors,
+        blur_kernel=0,      # Disable median filter - preserve high-frequency details
+        smooth_sigma=10     # Gentle bilateral filter - preserve edges
     )

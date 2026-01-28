@@ -1,6 +1,6 @@
 """
 Lumina Studio - Statistics Module
-使用统计功能
+Usage statistics functionality
 """
 
 import os

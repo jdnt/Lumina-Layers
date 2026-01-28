@@ -1,6 +1,6 @@
 """
 Lumina Studio - Calibration Generator Module
-校准板生成模块
+Calibration board generation module
 """
 
 import os
@@ -107,10 +107,10 @@ def generate_calibration_board(color_mode: str, block_size_mm: float,
         for z in range(PrinterConfig.COLOR_LAYERS):
             full_matrix[z, py:py+pixels_per_block, px:px+pixels_per_block] = stack[z]
 
-    # Corner markers - 根据模式设置不同的角点颜色
-    # 角点位置: (row, col, mat_id)
-    # row=0是顶部, row=total_h-1是底部
-    # col=0是左边, col=total_w-1是右边
+    # Corner markers - Set different corner colors based on mode
+    # Corner positions: (row, col, mat_id)
+    # row=0 is top, row=total_h-1 is bottom
+    # col=0 is left, col=total_w-1 is right
     if "RYBW" in color_mode:
         # RYBW: slots = [White(0), Red(1), Yellow(2), Blue(3)]
         # corner_labels: TL=White, TR=Red, BR=Blue, BL=Yellow
